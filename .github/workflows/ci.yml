@@ -7,7 +7,7 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
@@ -22,6 +22,16 @@ jobs:
         run: node --check remote/mcp.js
       - name: Generate lock
         run: uv lock
+      - name: Commit regenerated lock on branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/astra-safe-animation-mcp'
+        run: |
+          if ! git diff --quiet -- uv.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add uv.lock
+            git commit -m "chore: regenerate uv.lock"
+            git push origin HEAD:astra-safe-animation-mcp
+          fi
       - name: Sync
         run: uv sync --extra dev --locked
       - name: Unit tests
