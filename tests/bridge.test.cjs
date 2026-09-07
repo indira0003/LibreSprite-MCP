@@ -71,6 +71,7 @@ test('HTTP 0 retains token and retries with backoff', () => {
 test('lost pair reply retries same instance; ALREADY_PAIRED keeps retrying', () => {
   const h = harness();
   const body = h.requests[0][4];
+  assert.equal(h.requests[0][1].includes(JSON.parse(body).bridge_id), false);
   h.reply(h.requests[0], 0, null); h.tick(500);
   assert.equal(h.requests[1][4], body);
   h.reply(h.requests[1], 409, {ok:false,error:{code:'ALREADY_PAIRED'}});

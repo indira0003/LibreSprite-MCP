@@ -29,8 +29,10 @@ const global = this;
   let lastResult = null;
   let statusLabel = null;
   let toggleButton = null;
-  // Nonce identifies retries of this script instance, not a persisted credential.
+  // Native fetch logs storage keys. Keep the pairing nonce separate from those
+  // public event IDs, since /pair retries can recover the session token with it.
   const instanceId = String(Date.now()) + "_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  const bridgeId = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   let dialog = null;
 
   const log = function() {
@@ -117,7 +119,7 @@ const global = this;
       "/pair",
       {
         protocol_version: 1,
-        bridge_id: instanceId,
+        bridge_id: bridgeId,
         bridge_version: BRIDGE_VERSION,
         libresprite_version: String(app.version || ""),
         platform: String(app.platform || ""),
