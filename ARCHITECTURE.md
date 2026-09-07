@@ -41,7 +41,15 @@ Responses repeat the request ID and contain either a structured result or struct
 
 ## Pairing
 
-The relay binds to `127.0.0.1`. LibreSprite performs one-time loopback pairing and receives a cryptographically random session token. Subsequent `/next` and `/result` traffic sends that token in the `X-LibreSprite-Token` header. The token is deliberately not placed in URLs/query strings.
+The relay binds to `127.0.0.1`. LibreSprite performs loopback pairing and receives a cryptographically random session token. Subsequent `/next`, `/result` and `/disconnect` traffic sends that token in the `X-LibreSprite-Token` header. The token is never placed in URLs/query strings.
+
+An authenticated session has a 30-second inactivity lease. Expiration clears bridge metadata, cancels old queued/in-flight calls, and invalidates the token. A new script can then pair without restarting Python. A per-script nonce makes retries of a lost pairing response idempotent; it is not persisted or logged. A different script cannot replace an active lease. Explicit disconnect releases it immediately when delivery succeeds.
+
+`/next` responds immediately, including when idle. LibreSprite waits at least 500 ms between idle polls and backs off from 500 ms to 5 seconds after errors. `app.yield(event, cycles)` drives scheduling, while `Date.now()` measures milliseconds. Each native fetch has a unique storage key and its callback is registered before fetching. Late callbacks cannot overwrite current requests; an 8-second watchdog recovers stored replies when their events are lost. Three consecutive missing native completions stop polling to bound outstanding native requests, since `storage.fetch` has no cancellation API.
+
+The relay delivers one operation ID at a time. A lost `/next` reply redelivers the same ID; the bridge retains the last result instead of executing it again. Failed result posts retry that result, and the relay acknowledges duplicate results idempotently. Expired queued operations are removed before they can execute. An already delivered operation can have an unknown outcome on timeout: the caller is told to inspect the sprite, and no automatic edit retry crosses a session change. This is not a claim of exactly-once execution across editor/process crashes.
+
+The dialog and widgets are retained and updated in place. Closing the dialog stops the script's poll loop, with best-effort disconnect and lease expiry as fallback. LibreSprite uses a shared scripting engine: running another unrelated script may replace its context, so keep `mcp.js` as the active script during an agent editing session.
 
 This is a local TOFU design, not a claim that a compromised local machine can be made trustworthy. SAFE mode still restricts the paired bridge to its operation whitelist.
 

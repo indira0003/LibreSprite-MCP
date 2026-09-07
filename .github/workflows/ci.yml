@@ -20,6 +20,8 @@ jobs:
           enable-cache: true
       - name: Validate LibreSprite bridge JavaScript
         run: node --check remote/mcp.js
+      - name: Bridge transport regression tests
+        run: node --test tests/bridge.test.cjs
       - name: Validate committed lockfile
         run: uv lock --check
       - name: Sync

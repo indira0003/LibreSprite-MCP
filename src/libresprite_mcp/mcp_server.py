@@ -66,7 +66,7 @@ def _png_bytes_from_result(result: dict[str, Any]) -> bytes:
         y = int(layer.get("y", 0))
         # Use a canvas-sized temporary layer so negative/out-of-canvas cel positions crop safely.
         placed = PILImage.new("RGBA", canvas.size, (0, 0, 0, 0))
-        placed.paste(image, (x, y), image)
+        placed.paste(image, (x, y))
         canvas = PILImage.alpha_composite(canvas, placed)
 
     out = io.BytesIO()
@@ -394,7 +394,7 @@ class MCPServer:
                 return {"ok": True, "same_size": False, "size_a": list(a.size), "size_b": list(b.size)}
 
             difference = ImageChops.difference(a, b)
-            bbox = difference.getbbox()
+            bbox = difference.getbbox(alpha_only=False)
             changed = 0
             if bbox:
                 pa = a.load()

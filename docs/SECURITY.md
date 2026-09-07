@@ -9,13 +9,16 @@ DEV mode intentionally reintroduces arbitrary JavaScript execution for debugging
 ## Local relay
 
 The HTTP relay binds only to loopback. It uses:
-- one-time loopback pairing,
+- loopback pairing with a 30-second inactivity lease and token rotation,
 - a 256-bit-class random URL-safe session token,
 - request IDs,
 - bounded queues,
 - finite tool timeouts,
 - request body limits,
 - stale/unknown result rejection.
+- browser Origin and non-loopback Host rejection.
+
+Expired/replaced sessions cancel pending calls and reject old tokens. Lost pairing replies can be retried using the same per-script nonce. This nonce is a local retry identifier, not a claim of cryptographic authentication against other local processes. Duplicate result acknowledgments are idempotent; a timed-out delivered edit can have an unknown outcome and must be inspected before retrying.
 
 Pairing is TOFU. A malicious process already running on the same machine could race the real bridge to pair first. After pairing, SAFE mode still limits the client to the whitelisted dispatcher.
 

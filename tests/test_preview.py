@@ -52,3 +52,9 @@ def test_resolved_rgba_layer_composition():
     image = PILImage.open(io.BytesIO(raw)).convert("RGBA")
     assert image.getpixel((1, 0)) == (255, 0, 0, 255)
     assert image.getpixel((2, 1)) == (255, 255, 255, 255)
+
+
+def test_translucent_preview_does_not_apply_alpha_twice():
+    raw = _png_bytes_from_result({"canvas_width": 2, "canvas_height": 2,
+        "layers": [{"x": 0, "y": 0, "png_data_uri": data_uri((255, 0, 0, 128))}]})
+    assert PILImage.open(io.BytesIO(raw)).getpixel((0, 0)) == (255, 0, 0, 128)

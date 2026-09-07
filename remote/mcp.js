@@ -8,9 +8,10 @@
 const global = this;
 
 (function LibreSpriteMCPBridge() {
-  const BRIDGE_VERSION = "0.2.1-safe";
+  const BRIDGE_VERSION = "0.2.2-safe";
   const BASE = "http://127.0.0.1:64823";
-  const POLL_DELAY = 30;
+  const POLL_MS = 500;
+  const FETCH_TIMEOUT_MS = 8000;
   const MAX_PIXELS = 262144;
 
   let active = false;
@@ -18,8 +19,18 @@ const global = this;
   let token = null;
   let mode = "safe";
   let bridgeError = "";
-  let getCb = null;
-  let postCb = null;
+  let request = null;
+  let sequence = 0;
+  let nextAt = 0;
+  let failures = 0;
+  let missingCallbacks = 0;
+  let tickScheduled = false;
+  let resultToSend = null;
+  let lastResult = null;
+  let statusLabel = null;
+  let toggleButton = null;
+  // Nonce identifies retries of this script instance, not a persisted credential.
+  const instanceId = String(Date.now()) + "_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   let dialog = null;
 
   const log = function() {
@@ -28,62 +39,70 @@ const global = this;
     } catch (_) {}
   };
 
-  function fetchGet(url, cb, auth) {
-    if (auth && token) {
-      storage.fetch(url, "_mcp_get", "", "X-LibreSprite-Token", token);
+  function schedule(delay) {
+    nextAt = Date.now() + delay;
+    if (!tickScheduled && active) {
+      tickScheduled = true;
+      // app.yield's second argument is task-manager cycles, NOT milliseconds.
+      app.yield("mcp_tick_" + instanceId, 10);
+    }
+  }
+
+  function jsonRequest(path, body, cb, auth) {
+    if (request) return;
+    const key = "_mcp_" + instanceId + "_" + (++sequence);
+    const args = [BASE + path, key, ""];
+    if (body !== null) args.push("POST", JSON.stringify(body), "Content-Type", "application/json");
+    if (auth && token) args.push("X-LibreSprite-Token", token);
+    // Register BEFORE starting native work. Each completion has a unique key;
+    // a late response can never consume a newer callback or session token.
+    request = { key: key, callback: cb, started: Date.now() };
+    schedule(0);
+    try {
+      storage.fetch.apply(storage, args);
+    } catch (e) {
+      request = null;
+      cb(null, String(e), 0);
+    }
+  }
+
+  function completeFetch(key) {
+    const text = storage.get(key);
+    const status = Number(storage.get(key + "_status"));
+    storage.unload(key);
+    storage.unload(key + "_status");
+    if (!request || request.key !== key) return;
+    const callback = request.callback;
+    request = null;
+    missingCallbacks = 0;
+    let data = null;
+    try { data = JSON.parse(text); } catch (_) {}
+    if (status < 200 || status >= 300 || !data || data.ok === false) {
+      const code = data && data.error ? data.error.code : "";
+      callback(data, "HTTP " + status + (code ? " " + code : ""), status);
     } else {
-      storage.fetch(url, "_mcp_get");
+      callback(data, null, status);
     }
-    getCb = function() {
-      cb(storage.get("_mcp_get"), storage.get("_mcp_get_status"));
-    };
   }
 
-  function fetchPost(url, body, cb, auth) {
-    const args = [
-      url,
-      "_mcp_post",
-      "",
-      "POST",
-      body,
-      "Content-Type",
-      "application/json"
-    ];
-    if (auth && token) {
-      args.push("X-LibreSprite-Token", token);
+  function retry(err, status) {
+    if (!polling) { schedule(0); return; }
+    if (status === 401) {
+      token = null;
+      resultToSend = null;
+      lastResult = null;
     }
-    storage.fetch.apply(storage, args);
-    postCb = function() {
-      cb(storage.get("_mcp_post"), storage.get("_mcp_post_status"));
-    };
+    failures++;
+    log("LibreSprite MCP: " + err + "; retry " + failures);
+    bridgeError = "Reconnecting: " + err;
+    paintUI();
+    schedule(Math.min(5000, 500 * Math.pow(2, Math.min(failures - 1, 4))));
   }
 
-  function jsonGet(url, cb, auth) {
-    fetchGet(url, function(text, status) {
-      if (status !== 200) {
-        cb(null, "HTTP " + status + " " + String(text || ""));
-        return;
-      }
-      try {
-        cb(JSON.parse(text), null);
-      } catch (e) {
-        cb(null, String(e));
-      }
-    }, auth);
-  }
-
-  function jsonPost(url, obj, cb, auth) {
-    fetchPost(url, JSON.stringify(obj), function(text, status) {
-      if (status < 200 || status >= 300) {
-        cb(null, "HTTP " + status + " " + String(text || ""));
-        return;
-      }
-      try {
-        cb(JSON.parse(text), null);
-      } catch (e) {
-        cb(null, String(e));
-      }
-    }, auth);
+  function success() {
+    failures = 0;
+    bridgeError = "";
+    paintUI();
   }
 
   function pair() {
@@ -94,48 +113,62 @@ const global = this;
       return;
     }
 
-    jsonPost(
-      BASE + "/pair",
+    jsonRequest(
+      "/pair",
       {
+        protocol_version: 1,
+        bridge_id: instanceId,
         bridge_version: BRIDGE_VERSION,
         libresprite_version: String(app.version || ""),
         platform: String(app.platform || ""),
         storage: typeof storage !== "undefined",
         storage_fetch: typeof storage.fetch === "function"
       },
-      function(data, err) {
+      function(data, err, status) {
         if (err) {
-          bridgeError = err;
+          retry(err, status);
+          return;
+        }
+        if (data.protocol_version !== 1 || typeof data.session_token !== "string" ||
+            (data.mode !== "safe" && data.mode !== "dev")) {
+          bridgeError = "Incompatible relay; update Python server and mcp.js together";
+          polling = false;
           paintUI();
           return;
         }
         token = data.session_token;
-        mode = data.mode || "safe";
-        polling = true;
-        bridgeError = "";
-        paintUI();
-        app.yield("poll");
+        mode = data.mode;
+        success();
+        schedule(0);
       },
       false
     );
   }
 
-  function authGetNext(cb) {
-    jsonGet(BASE + "/next", cb, true);
+  function postResult(result) {
+    resultToSend = result;
+    lastResult = result;
+    schedule(0);
   }
 
-  function postResult(result) {
-    jsonPost(BASE + "/result", result, function(_, err) {
-      if (err) {
-        bridgeError = err;
-        polling = false;
-        token = null;
-        paintUI();
+  function sendResult() {
+    jsonRequest("/result", resultToSend, function(data, err, status) {
+      // The caller may already have timed out. Drop this result, never rerun
+      // the edit, and keep the authenticated connection usable.
+      if (status === 409 && data && data.error && data.error.code === "UNKNOWN_REQUEST_ID") {
+        log("LibreSprite MCP: result arrived after caller timeout; inspect sprite before retrying");
+        resultToSend = null;
+        success();
+        schedule(POLL_MS);
         return;
       }
-      if (polling) {
-        app.yield("poll", POLL_DELAY);
+      if (err) {
+        retry(err, status);
+        return;
       }
+      resultToSend = null;
+      success();
+      schedule(0);
     }, true);
   }
 
@@ -870,6 +903,14 @@ const global = this;
   }
 
   function execute(req) {
+    if (req.protocol_version !== 1) {
+      fail(req.request_id, "PROTOCOL_MISMATCH", "Unsupported operation protocol");
+      return;
+    }
+    if (lastResult && lastResult.request_id === req.request_id) {
+      postResult(lastResult);
+      return;
+    }
     const rid = req.request_id;
     const op = req.operation;
     const payload = req.payload || {};
@@ -887,80 +928,131 @@ const global = this;
 
   function poll() {
     if (!polling || !token) return;
-    authGetNext(function(data, err) {
+    jsonRequest("/next", null, function(data, err, status) {
       if (err) {
-        bridgeError = err;
-        polling = false;
-        token = null;
-        paintUI();
+        retry(err, status);
         return;
       }
+      success();
+      if (!polling) { schedule(0); return; }
       if (data && data.idle) {
-        app.yield("poll", POLL_DELAY);
+        schedule(POLL_MS);
         return;
       }
       if (data && data.request_id && data.operation) {
         execute(data);
         return;
       }
-      app.yield("poll", POLL_DELAY);
-    });
+      retry("Malformed operation response", 0);
+    }, true);
   }
 
   function paintUI() {
-    if (dialog) dialog.close();
-    dialog = app.createDialog();
+    if (!dialog || !active) return;
     dialog.title = "LibreSprite MCP (" + mode.toUpperCase() + ")";
     if (bridgeError) {
-      dialog.addLabel("Error: " + bridgeError);
+      statusLabel.text = bridgeError;
+    } else if (polling && token) {
+      statusLabel.text = "Connected - " + mode.toUpperCase() + " mode";
     } else if (polling) {
-      dialog.addLabel("Connected - " + mode.toUpperCase() + " mode");
+      statusLabel.text = "Connecting...";
     } else {
-      dialog.addLabel("Disconnected");
+      statusLabel.text = "Disconnected";
     }
-    dialog.addBreak();
-    if (!polling) dialog.addButton("Connect", "connect");
-    else dialog.addButton("Disconnect", "disconnect");
+    toggleButton.text = polling ? "Disconnect" : "Connect";
+  }
+
+  function tick() {
+    tickScheduled = false;
+    if (!active) return;
+    if (request && Date.now() - request.started >= FETCH_TIMEOUT_MS) {
+      // Native storage is populated before *_fetch is dispatched. Recover a
+      // lost event without issuing another native request when possible.
+      if (storage.get(request.key + "_status") !== undefined) {
+        completeFetch(request.key);
+      } else {
+        request = null;
+        missingCallbacks++;
+        if (missingCallbacks >= 3) {
+          // storage.fetch has no cancellation API. Bound abandoned native
+          // requests if this runtime stops delivering any completions at all.
+          polling = false;
+          token = null;
+          bridgeError = "Native fetch stopped responding; reopen mcp.js";
+          paintUI();
+        } else {
+          retry("fetch callback timeout", 0);
+        }
+      }
+    }
+    if (!request && Date.now() >= nextAt) {
+      if (polling) {
+        if (!token) pair();
+        else if (resultToSend) sendResult();
+        else poll();
+      } else if (token) {
+        jsonRequest("/disconnect", {}, function() {
+          token = null;
+          resultToSend = null;
+          lastResult = null;
+          paintUI();
+        }, true);
+      }
+    }
+    if ((polling || request || token) && !tickScheduled) {
+      tickScheduled = true;
+      app.yield("mcp_tick_" + instanceId, 10);
+    }
   }
 
   function onEvent(event) {
+    if (event.indexOf("_mcp_") === 0 && event.slice(-6) === "_fetch") {
+      completeFetch(event.slice(0, -6));
+      return;
+    }
+    if (event === "mcp_tick_" + instanceId) { tick(); return; }
     switch (event) {
       case "init":
         active = true;
+        dialog = app.createDialog("mcp_dialog");
+        statusLabel = dialog.addLabel("Disconnected", "mcp_status");
+        dialog.addBreak();
+        toggleButton = dialog.addButton("Connect", "mcp_toggle");
         if (typeof storage === "undefined" || typeof storage.fetch !== "function") {
           bridgeError = "storage.fetch is unavailable in this LibreSprite build.";
         }
         paintUI();
         return;
-      case "_close":
-        active = false;
+      case "mcp_dialog_close":
+        // Best-effort release if no fetch is active. Otherwise the bounded
+        // lease permits a newly opened script to pair automatically.
         polling = false;
-        token = null;
+        if (token && !request) {
+          jsonRequest("/disconnect", {}, function() { token = null; }, true);
+        }
+        active = false;
+        dialog = null;
+        return;
+      case "mcp_toggle_click":
+        if (polling) {
+          polling = false;
+        } else {
+          polling = true;
+          bridgeError = "";
+        }
+        paintUI();
+        schedule(0);
         return;
       case "connect_click":
-        pair();
+        polling = true;
+        bridgeError = "";
+        paintUI();
+        schedule(0);
         return;
       case "disconnect_click":
         polling = false;
-        token = null;
         paintUI();
-        return;
-      case "_mcp_get_fetch":
-        if (getCb) {
-          const fn = getCb;
-          getCb = null;
-          fn();
-        }
-        return;
-      case "_mcp_post_fetch":
-        if (postCb) {
-          const fn = postCb;
-          postCb = null;
-          fn();
-        }
-        return;
-      case "poll":
-        if (active) poll();
+        schedule(0);
         return;
       default:
         return;

@@ -15,7 +15,10 @@ def main() -> None:
     config = RelayConfig(port=args.port, timeout=args.timeout, mode=args.mode, allowed_root=args.allowed_root)
     proxy = LibrespriteProxy(config)
     proxy.start()
-    MCPServer(proxy).run("stdio")
+    try:
+        MCPServer(proxy).run("stdio")
+    finally:
+        proxy.stop()
 
 if __name__ == "__main__":
     main()

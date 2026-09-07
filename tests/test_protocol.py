@@ -38,3 +38,11 @@ def test_path_scope(tmp_path):
     outside=tmp_path/"outside.png"
     with pytest.raises(ValueError):
         normalize_allowed_path(str(outside), str(root))
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_timeouts_must_be_finite_and_positive(value):
+    with pytest.raises(ValueError):
+        RelayConfig(timeout=value)
+    with pytest.raises(ValueError):
+        RelayConfig(lease_seconds=value)

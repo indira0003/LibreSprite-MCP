@@ -32,3 +32,16 @@ def test_tool_schemas_are_generated():
     assert "pixels" in schema["properties"]
     assert "layer" in schema["properties"]
     assert "frame" in schema["properties"]
+
+
+def test_compare_detects_rgb_changes_with_identical_alpha():
+    import asyncio
+    server = MCPServer(LibrespriteProxy(RelayConfig()))
+    def call(operation, **payload):
+        color = [255, 0, 0, 255] if payload["frame"] == 0 else [0, 255, 0, 255]
+        return {"canvas_width": 1, "canvas_height": 1, "layers": [
+            {"x": 0, "y": 0, "width": 1, "height": 1, "rgba": color}]}
+    server.call = call
+    tool = server.mcp._tool_manager.get_tool("compare_frames")
+    result = asyncio.run(tool.run({"frame_a": 0, "frame_b": 1}, convert_result=False))
+    assert result["changed_pixel_count"] == 1

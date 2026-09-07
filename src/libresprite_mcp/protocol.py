@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -69,12 +70,17 @@ class RelayConfig:
     timeout: float = DEFAULT_TIMEOUT
     mode: str = "safe"
     allowed_root: str | None = None
+    lease_seconds: float = 30.0
 
     def __post_init__(self):
         if self.host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Relay host must be loopback-only")
         if self.mode not in {"safe", "dev"}:
             raise ValueError("mode must be 'safe' or 'dev'")
+        if not 0 <= self.port <= 65535:
+            raise ValueError("port must be 0..65535")
+        if any(not math.isfinite(v) or v <= 0 for v in (self.timeout, self.lease_seconds)):
+            raise ValueError("timeout and lease_seconds must be finite and positive")
 
 
 def new_request_id() -> str:

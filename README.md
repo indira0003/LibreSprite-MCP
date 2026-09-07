@@ -19,7 +19,7 @@ The MCP provides mechanical editing primitives only: frames, layers, cels, pixel
 - Requests have timeouts and payload limits; stale/unknown request IDs are rejected.
 - `run_script` is registered **only** in DEV mode and the bridge checks DEV mode again before evaluating it.
 
-The one-time pairing endpoint is intentionally a local TOFU mechanism: a malicious local process that races LibreSprite to pair first could claim the session. SAFE mode still limits the paired client to the whitelisted dispatcher. See `docs/SECURITY.md`.
+The pairing endpoint is intentionally a local TOFU mechanism: a malicious local process that races LibreSprite to pair first could claim the session. SAFE mode still limits the paired client to the whitelisted dispatcher. See `docs/SECURITY.md`.
 
 ## Windows install
 
@@ -63,6 +63,10 @@ remote/mcp.js
 into LibreSprite's scripts folder. In LibreSprite, rescan/open scripts and run `mcp.js`. A small dialog appears. Start your MCP client first, then click **Connect**. The bridge pairs to `127.0.0.1:64823`.
 
 If LibreSprite reports that `storage.fetch` is unavailable, that LibreSprite build cannot use this relay. The bridge does not invent an unsafe fallback.
+
+Update **both** the Python server and `remote/mcp.js`, then restart the MCP client and run the updated script. Temporary HTTP failures now show `Reconnecting` and retry automatically. If a previous script disappeared without disconnecting, its lease expires after 30 seconds; leave the new script connecting and it will recover. Only one live script owns the relay at a time.
+
+See [the transport investigation and real-executable validation](docs/TRANSPORT-REPAIR.md). The original two-second long poll was tested successfully on Windows: it was not established as the cause of the reported HTTP 0.
 
 ## MCP client configuration
 
@@ -138,10 +142,20 @@ PNG/GIF export uses LibreSprite's normal `saveAs(..., asCopy=true)` behavior. Li
 ```powershell
 uv sync --extra dev
 uv run pytest
+node --test tests/bridge.test.cjs
 uv run pip-audit
 ```
 
 The repository includes unit tests that do not require LibreSprite and a CI workflow. Live LibreSprite tests are intentionally separate because a GitHub runner has no interactive LibreSprite session.
+
+Real-executable integration tests (creates only test documents and launches a separate editor process):
+
+```powershell
+$env:LIBRESPRITE_MCP_LIVE_EXE="C:\path\to\libresprite.exe"
+uv run pytest tests/test_live_libresprite.py -v
+```
+
+These tests exercise pixels, independent duplicated frames, PNG previews, save-as, transient HTTP failures, relay restart, and the complete SDK client → STDIO → Python → HTTP → real LibreSprite chain. Without the executable variable they are skipped, never replaced by a passing marker.
 
 ## Tool reference
 
