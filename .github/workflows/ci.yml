@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - astra-safe-animation-mcp
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: "0.12.10"
+          enable-cache: true
+      - name: Validate LibreSprite bridge JavaScript
+        run: node --check remote/mcp.js
+      - name: Bridge transport regression tests
+        run: node --test tests/bridge.test.cjs
+      - name: Validate committed lockfile
+        run: uv lock --check
+      - name: Sync
+        run: uv sync --extra dev --locked
+      - name: Unit tests
+        run: uv run pytest -q
+      - name: Ruff
+        run: uv run ruff check src tests
+      - name: Dependency audit
+        run: uv run pip-audit

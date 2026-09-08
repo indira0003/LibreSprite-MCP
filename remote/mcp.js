@@ -1,402 +1,1082 @@
-/**
- * Source: https://github.com/Snehil-Shah/libresprite-mcp
+/*
+ * LibreSprite MCP bridge - SAFE by default.
+ * GPL-2.0-only. Derived from Snehil-Shah/LibreSprite-MCP.
+ *
+ * SAFE mode accepts only named operations dispatched below. Arbitrary JavaScript
+ * exists only in explicit DEV mode and is rejected in SAFE mode on both sides.
  */
-
-// Cache the global context.
 const global = this;
 
-/**
- * Model Context Protocol (MCP) remote script that interacts with the libresprite-mcp server.
- *
- * NOTE: Defined as an IIFE to avoid global namespace pollution.
- */
-(function MCP() {
-    // CONSTANTS //
+(function LibreSpriteMCPBridge() {
+  const BRIDGE_VERSION = "0.2.3-safe";
+  const BASE = "http://127.0.0.1:64823";
+  const POLL_MS = 500;
+  const FETCH_TIMEOUT_MS = 8000;
+  const MAX_PIXELS = 262144;
 
-    /**
-     * URL to the relay server exposing the next command.
-     */
-    const RELAY_SERVER_URL = 'http://localhost:64823';
+  let active = false;
+  let polling = false;
+  let token = null;
+  let mode = "safe";
+  let bridgeError = "";
+  let request = null;
+  let sequence = 0;
+  let nextAt = 0;
+  let failures = 0;
+  let missingCallbacks = 0;
+  let tickScheduled = false;
+  let resultToSend = null;
+  let lastResult = null;
+  let executing = false;
+  let statusLabel = null;
+  let toggleButton = null;
+  // Native fetch logs storage keys. Keep the pairing nonce separate from those
+  // public event IDs, since /pair retries can recover the session token with it.
+  const instanceId = String(Date.now()) + "_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  const bridgeId = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  let dialog = null;
 
-    /**
-     * Delay between polling requests. (in number of rendering cycles)
-     */
-    const POLL_DELAY = 120;
+  const log = function() {
+    try {
+      global.console.log.apply(global.console, arguments);
+    } catch (_) {}
+  };
 
+  function schedule(delay) {
+    nextAt = Date.now() + delay;
+    if (!tickScheduled && active) {
+      tickScheduled = true;
+      // app.yield's second argument is task-manager cycles, NOT milliseconds.
+      app.yield("mcp_tick_" + instanceId, 10);
+    }
+  }
 
-    // VARIABLES //
+  function jsonRequest(path, body, cb, auth) {
+    if (request) return;
+    const key = "_mcp_" + instanceId + "_" + (++sequence);
+    const args = [BASE + path, key, ""];
+    if (body !== null) args.push("POST", JSON.stringify(body), "Content-Type", "application/json");
+    if (auth && token) args.push("X-LibreSprite-Token", token);
+    // Register BEFORE starting native work. Each completion has a unique key;
+    // a late response can never consume a newer callback or session token.
+    request = { key: key, callback: cb, started: Date.now() };
+    schedule(0);
+    try {
+      storage.fetch.apply(storage, args);
+    } catch (e) {
+      request = null;
+      cb(null, String(e), 0);
+    }
+  }
 
-    /**
-     * Flag indicating extension state.
-     *
-     * @type {boolean}
-     */
-    let active = false;
+  function completeFetch(key) {
+    const text = storage.get(key);
+    const status = Number(storage.get(key + "_status"));
+    storage.unload(key);
+    storage.unload(key + "_status");
+    if (!request || request.key !== key) return;
+    const callback = request.callback;
+    request = null;
+    missingCallbacks = 0;
+    let data = null;
+    try { data = JSON.parse(text); } catch (_) {}
+    if (status < 200 || status >= 300 || !data || data.ok === false) {
+      const code = data && data.error ? data.error.code : "";
+      callback(data, "HTTP " + status + (code ? " " + code : ""), status);
+    } else {
+      callback(data, null, status);
+    }
+  }
 
-    /**
-     * Flag indicating whether polling is active.
-     *
-     * @type {boolean}
-     */
-    let polling = false;
+  function retry(err, status) {
+    if (!polling) { schedule(0); return; }
+    if (status === 401) {
+      token = null;
+      resultToSend = null;
+      lastResult = null;
+    }
+    failures++;
+    log("LibreSprite MCP: " + err + "; retry " + failures);
+    bridgeError = "Reconnecting: " + err;
+    paintUI();
+    schedule(Math.min(5000, 500 * Math.pow(2, Math.min(failures - 1, 4))));
+  }
 
-    /**
-     * Flag indicating whether the client is connected to the server.
-     *
-     * @type {boolean}
-     */
-    let connected = false;
+  function success() {
+    failures = 0;
+    bridgeError = "";
+    paintUI();
+  }
 
-    /**
-     * Stores stdout.
-     *
-     * @type {string}
-     */
-    let output = '';
-
-    /**
-     * Function to get response from storage in the next cycle.
-     *
-     * @type {Function|null}
-     */
-    let _get_response = null;
-
-    /**
-     * Function to post response to storage in the next cycle.
-     *
-     * @type {Function|null}
-     */
-    let _post_response = null;
-
-    /**
-     * Dialog instance for UI.
-     */
-    let dialog = null;
-
-
-    // FUNCTIONS //
-
-    /**
-     * Global `console.log`.
-     */
-    const _clientLogger = global.console.log;
-
-    // Override global console object to capture stdout.
-    const console = Object.assign({}, global.console);
-
-    /**
-     * Modified `console.log` that captures output before logging.
-     */
-    console.log = function() {
-        var args = Array.prototype.slice.call(arguments);
-        output += args.join(' ') + '\n';
-        _clientLogger.apply(null, args);
+  function pair() {
+    if (typeof storage === "undefined" || typeof storage.fetch !== "function") {
+      bridgeError = "storage.fetch is unavailable in this LibreSprite build.";
+      log("LibreSprite MCP:", bridgeError);
+      paintUI();
+      return;
     }
 
-    /**
-     * Makes a GET request.
-     *
-     * @private
-     * @param {string} url - url to fetch
-     * @param {Function} cb - callback function to handle the response
-     */
-    function _get(url, cb) {
-        storage.fetch(url, '_get_response');
-        _get_response = function() {
-            const status = storage.get('_get_response' + '_status');
-            const string = storage.get('_get_response');
-            cb({
-                string,
-                status
-            });
-        };
-    }
-
-    /**
-     * Makes a POST request.
-     *
-     * @private
-     * @param {string} url - url to fetch
-     * @param {string} body - request body
-     * @param {Function} cb - callback function to handle the response
-     */
-    function _post(url, body, cb) {
-        storage.fetch(url, '_post_response', "", "POST", body, "Content-Type", "application/json");
-        _post_response = function() {
-            const status = storage.get('_post_response' + '_status');
-            const string = storage.get('_post_response');
-            cb({
-                string,
-                status
-            });
+    jsonRequest(
+      "/pair",
+      {
+        protocol_version: 1,
+        bridge_id: bridgeId,
+        bridge_version: BRIDGE_VERSION,
+        libresprite_version: String(app.version || ""),
+        platform: String(app.platform || ""),
+        storage: typeof storage !== "undefined",
+        storage_fetch: typeof storage.fetch === "function"
+      },
+      function(data, err, status) {
+        if (err) {
+          retry(err, status);
+          return;
         }
-    }
-
-    /**
-     * Makes a GET request.
-     *
-     * @param {string} url - url to fetch
-     * @param {Function} cb - callback function to handle the response
-     */
-    function get(url, cb) {
-        _get(url, function(rsp) {
-            var data, error = rsp.status != 200 ? 'status:' + rsp.status : 0;
-            try {
-                if (!error)
-                    data = JSON.parse(rsp.string);
-            } catch (ex) {
-                error = ex;
-            }
-            cb(data, error);
-        });
-    }
-
-    /**
-     * Makes a POST request.
-     *
-     * @param {string} url - url to fetch
-     * @param {Object} body - request body
-     * @param {Function} cb - callback function to handle the response
-     */
-    function post(url, body, cb) {
-        _post(url, body, function(rsp) {
-            var data, error = rsp.status != 200 ? 'status:' + rsp.status : 0;
-            try {
-                if (!error)
-                    data = JSON.parse(rsp.string);
-                else error += rsp.string;
-            } catch (ex) {
-                error = ex;
-            }
-            cb(data, error);
-        });
-    }
-
-    /**
-     * Pings for server health.
-     *
-     * This yields a "bad_health" event if the server is unreachable,
-     * or an "init" event if the server is reachable.
-     */
-    function checkServerHealth() {
-        get(RELAY_SERVER_URL + '/ping', function(data, error) {
-            if (error) {
-                connected = false;
-                app.yield("bad_health", POLL_DELAY);
-                return;
-            }
-            if (data && data.status === 'pong') {
-                connected = true;
-                app.yield("good_health");
-            } else {
-                connected = false;
-                app.yield("bad_health", POLL_DELAY);
-            }
-
-        });
-    }
-
-    /**
-     * Fetches the next script from the server.
-     *
-     * @param {Function} cb - script handler
-     */
-    function getScript(cb) {
-        get(RELAY_SERVER_URL, function(data, error) {
-            if (error) {
-                // The post request will log the error.
-                cb('');
-                return;
-            }
-            cb((data && data.script) ? data.script : '');
-        });
-    }
-
-    /**
-     * Posts the output to the server.
-     */
-    function postOutput() {
-        const body = JSON.stringify({output: output});
-        post(RELAY_SERVER_URL, body, function(data, error) {
-            // NOTE: This is the last interaction with the MCP server for a tool call and hence we ensure updates to the UI and connection status.
-            if (error) {
-                _clientLogger('The MCP server was shut down.');
-                connected = false;
-                paintUI();
-                app.yield("bad_health", POLL_DELAY);
-                return;
-            }
-            if ( !data ) {
-                _clientLogger('Something went wrong. Please report it on https://github.com/Snehil-Shah/libresprite-mcp/issues.');
-                return;
-            }
-            if ( data.status === 'invalid' )
-                _clientLogger('Something is wrong. Please report it on https://github.com/Snehil-Shah/libresprite-mcp/issues.');
-            // Other status types can be ignored...
-            // Continue polling...
-            if (!polling) {
-                return;
-            }
-            app.yield("poll", POLL_DELAY);
-        });
-    }
-
-    /**
-     * Runs a script in the current context.
-     *
-     * @param {string} script - script to run
-     */
-    function runScript(script) {
-        if (!script) {
-            return;
+        if (data.protocol_version !== 1 || typeof data.session_token !== "string" ||
+            (data.mode !== "safe" && data.mode !== "dev")) {
+          bridgeError = "Incompatible relay; update Python server and mcp.js together";
+          polling = false;
+          paintUI();
+          return;
         }
-        try {
-            // Execute in global scope with our custom logger...
-            new Function('console', script)(console);
-        } catch (e) {
-            console.log('Error in script:', e.message);
+        token = data.session_token;
+        mode = data.mode;
+        success();
+        schedule(0);
+      },
+      false
+    );
+  }
+
+  function postResult(result) {
+    resultToSend = result;
+    lastResult = result;
+    schedule(0);
+  }
+
+  function sendResult() {
+    jsonRequest("/result", resultToSend, function(data, err, status) {
+      // The caller may already have timed out. Drop this result, never rerun
+      // the edit, and keep the authenticated connection usable.
+      if (status === 409 && data && data.error && data.error.code === "UNKNOWN_REQUEST_ID") {
+        log("LibreSprite MCP: result arrived after caller timeout; inspect sprite before retrying");
+        resultToSend = null;
+        success();
+        schedule(POLL_MS);
+        return;
+      }
+      if (err) {
+        retry(err, status);
+        return;
+      }
+      resultToSend = null;
+      success();
+      schedule(0);
+    }, true);
+  }
+
+  function ok(requestId, result) {
+    postResult({
+      protocol_version: 1,
+      request_id: requestId,
+      ok: true,
+      result: result || {}
+    });
+  }
+
+  function fail(requestId, code, message, details) {
+    postResult({
+      protocol_version: 1,
+      request_id: requestId,
+      ok: false,
+      error: {
+        code: code,
+        message: message,
+        details: details || {}
+      }
+    });
+  }
+
+  function requireSprite() {
+    if (!app.activeSprite) {
+      throw new Error("NO_ACTIVE_SPRITE");
+    }
+    return app.activeSprite;
+  }
+
+  function layerAt(index) {
+    const sprite = requireSprite();
+    if (!Number.isInteger(index) || index < 0 || index >= sprite.layerCount) {
+      throw new Error("LAYER_OUT_OF_RANGE");
+    }
+    const layer = sprite.layer(index);
+    if (!layer || !layer.isImage) {
+      throw new Error("LAYER_NOT_IMAGE");
+    }
+    return layer;
+  }
+
+  function celAt(layerIndex, frameIndex) {
+    const layer = layerAt(layerIndex);
+    const cel = layer.cel(frameIndex);
+    if (!cel) {
+      throw new Error("CEL_NOT_FOUND");
+    }
+    return cel;
+  }
+
+  function gotoFrame(frame) {
+    if (!Number.isInteger(frame) || frame < 0) {
+      throw new Error("FRAME_OUT_OF_RANGE");
+    }
+    app.command.clearParameters();
+    app.command.setParameter("frame", String(frame + 1));
+    app.command.GotoFrame();
+    app.command.clearParameters();
+    if (app.activeFrameNumber !== frame) {
+      throw new Error("FRAME_OUT_OF_RANGE");
+    }
+  }
+
+  function gotoLayer(layer) {
+    const sprite = requireSprite();
+    if (!Number.isInteger(layer) || layer < 0 || layer >= sprite.layerCount) {
+      throw new Error("LAYER_OUT_OF_RANGE");
+    }
+    let guard = sprite.layerCount + 1;
+    while (app.activeLayerNumber !== layer && guard-- > 0) {
+      app.command.GotoNextLayer();
+    }
+    if (app.activeLayerNumber !== layer) {
+      throw new Error("LAYER_SELECTION_FAILED");
+    }
+  }
+
+  function countFrames() {
+    requireSprite();
+    const original = app.activeFrameNumber;
+    app.command.GotoFirstFrame();
+    const first = app.activeFrameNumber;
+    let count = 1;
+    let guard = 0;
+    while (guard++ < 4096) {
+      app.command.GotoNextFrame();
+      if (app.activeFrameNumber === first) {
+        break;
+      }
+      count++;
+    }
+    if (guard >= 4096) {
+      throw new Error("FRAME_COUNT_GUARD_EXCEEDED");
+    }
+    gotoFrame(Math.min(original, count - 1));
+    return count;
+  }
+
+  function packedRGBA(p) {
+    const a = p.a === undefined ? 255 : p.a;
+    return app.pixelColor.rgba(p.r | 0, p.g | 0, p.b | 0, a | 0);
+  }
+
+  function rgbaComponents(packed) {
+    return {
+      r: app.pixelColor.rgbaR(packed),
+      g: app.pixelColor.rgbaG(packed),
+      b: app.pixelColor.rgbaB(packed),
+      a: app.pixelColor.rgbaA(packed)
+    };
+  }
+
+  function decodePixel(raw) {
+    const sprite = requireSprite();
+    if (sprite.colorMode === ColorMode.INDEXED) {
+      const palette = sprite.palette;
+      if (raw < 0 || raw >= palette.length) {
+        return { r: 0, g: 0, b: 0, a: 0, index: raw };
+      }
+      const c = rgbaComponents(palette.get(raw));
+      c.index = raw;
+      return c;
+    }
+    if (sprite.colorMode === ColorMode.GRAYSCALE) {
+      const v = app.pixelColor.grayaV(raw);
+      return { r: v, g: v, b: v, a: app.pixelColor.grayaA(raw) };
+    }
+    if (sprite.colorMode === ColorMode.BITMAP) {
+      return { r: raw ? 255 : 0, g: raw ? 255 : 0, b: raw ? 255 : 0, a: 255 };
+    }
+    return rgbaComponents(raw);
+  }
+
+  function encodePixel(p) {
+    const sprite = requireSprite();
+    const a = p.a === undefined ? 255 : p.a;
+    if (sprite.colorMode === ColorMode.INDEXED) {
+      const palette = sprite.palette;
+      for (let i = 0; i < palette.length; i++) {
+        const c = rgbaComponents(palette.get(i));
+        if (c.r === p.r && c.g === p.g && c.b === p.b && c.a === a) {
+          return i;
         }
+      }
+      throw new Error("COLOR_NOT_IN_PALETTE");
+    }
+    if (sprite.colorMode === ColorMode.GRAYSCALE) {
+      if (p.r !== p.g || p.g !== p.b) {
+        throw new Error("GRAYSCALE_REQUIRES_EQUAL_RGB");
+      }
+      return app.pixelColor.graya(p.r | 0, a | 0);
+    }
+    if (sprite.colorMode === ColorMode.BITMAP) {
+      if (!((p.r === 0 && p.g === 0 && p.b === 0) || (p.r === 255 && p.g === 255 && p.b === 255))) {
+        throw new Error("BITMAP_REQUIRES_BLACK_OR_WHITE");
+      }
+      return p.r === 255 ? 1 : 0;
+    }
+    return packedRGBA(p);
+  }
+
+  function validateRGBA(p) {
+    const vals = [p.r, p.g, p.b, p.a === undefined ? 255 : p.a];
+    for (let i = 0; i < vals.length; i++) {
+      if (!Number.isInteger(vals[i]) || vals[i] < 0 || vals[i] > 255) {
+        throw new Error("INVALID_RGBA");
+      }
+    }
+  }
+
+  function bytesFromImage(img) {
+    const raw = img.getImageData();
+    const out = [];
+    for (let i = 0; i < raw.length; i++) {
+      out.push(raw[i]);
+    }
+    return out;
+  }
+
+  function drawPixels(p) {
+    const cel = celAt(p.layer, p.frame);
+    const img = cel.image;
+    if (!Array.isArray(p.pixels) || p.pixels.length > MAX_PIXELS) {
+      throw new Error("PIXEL_LIMIT");
     }
 
-    /**
-     * Fetches, executes, and posts the output for the next script.
-     *
-     * NOTE: This is the entry point for the polling loop.
-     */
-    function exec() {
-        if (!polling) return;
-        getScript(script => {
-            output = ''; // sanity reset
-            runScript(script);
-            postOutput();
-        });
+    const prepared = [];
+    for (let i = 0; i < p.pixels.length; i++) {
+      const q = p.pixels[i];
+      if (!Number.isInteger(q.x) || !Number.isInteger(q.y)) {
+        throw new Error("INVALID_COORDINATE");
+      }
+      if (q.x < 0 || q.y < 0 || q.x >= img.width || q.y >= img.height) {
+        throw new Error("PIXEL_OUT_OF_RANGE");
+      }
+      validateRGBA(q);
+      prepared.push({ x: q.x, y: q.y, value: encodePixel(q) });
     }
 
-    /**
-     * Starts the polling loop.
-     */
-    function startPolling() {
-        if (polling) return;
-        polling = true;
-        exec();
+    for (let j = 0; j < prepared.length; j++) {
+      const q = prepared[j];
+      img.putPixel(q.x, q.y, q.value);
     }
+    requireSprite().commit();
+    return { written: prepared.length };
+  }
 
-    /**
-     * Stops the polling loop.
-     */
-    function stopPolling() {
-        polling = false;
+  function pixelsRegion(p) {
+    if (!Number.isInteger(p.width) || !Number.isInteger(p.height) || p.width <= 0 || p.height <= 0 || p.width * p.height > MAX_PIXELS) {
+      throw new Error("INVALID_REGION");
     }
-
-    /**
-     * Paints the UI dialog based on the current state.
-     */
-    function paintUI() {
-        let label;
-        if (!connected) {
-            label = 'Discovering MCP servers... Make sure the libresprite-mcp server is running.';
-        } else if (polling) {
-            label = 'Connected to the libresprite-mcp server!';
+    const img = celAt(p.layer, p.frame).image;
+    const pixels = [];
+    for (let yy = 0; yy < p.height; yy++) {
+      for (let xx = 0; xx < p.width; xx++) {
+        const x = p.x + xx;
+        const y = p.y + yy;
+        if (x < 0 || y < 0 || x >= img.width || y >= img.height) {
+          pixels.push({ r: 0, g: 0, b: 0, a: 0 });
         } else {
-            label = 'Found an active libresprite-mcp server, "Connect" when you are ready!';
+          pixels.push(decodePixel(img.getPixel(x, y)));
         }
-        if (dialog) {
-            dialog.close();
+      }
+    }
+    return { x: p.x, y: p.y, width: p.width, height: p.height, pixels: pixels };
+  }
+
+  function setRegion(p) {
+    if (!Number.isInteger(p.width) || !Number.isInteger(p.height) || p.width <= 0 || p.height <= 0 || p.width * p.height > MAX_PIXELS) {
+      throw new Error("INVALID_REGION");
+    }
+    if (!Array.isArray(p.rgba) || p.rgba.length !== p.width * p.height * 4) {
+      throw new Error("RGBA_LENGTH_MISMATCH");
+    }
+    const img = celAt(p.layer, p.frame).image;
+    const prepared = [];
+    let k = 0;
+    for (let yy = 0; yy < p.height; yy++) {
+      for (let xx = 0; xx < p.width; xx++) {
+        const q = { r: p.rgba[k++], g: p.rgba[k++], b: p.rgba[k++], a: p.rgba[k++] };
+        validateRGBA(q);
+        const x = p.x + xx;
+        const y = p.y + yy;
+        if (x < 0 || y < 0 || x >= img.width || y >= img.height) {
+          throw new Error("REGION_OUT_OF_RANGE");
         }
-        dialog = app.createDialog();
-        dialog.title = 'libresprite-mcp';
-        dialog.addLabel(label);
+        prepared.push({ x: x, y: y, value: encodePixel(q) });
+      }
+    }
+    for (let i = 0; i < prepared.length; i++) {
+      const q = prepared[i];
+      img.putPixel(q.x, q.y, q.value);
+    }
+    requireSprite().commit();
+    return { written: prepared.length };
+  }
+
+  function copyOrMoveRegion(p, move) {
+    const img = celAt(p.layer, p.frame).image;
+    if (p.width <= 0 || p.height <= 0 || p.width * p.height > MAX_PIXELS) {
+      throw new Error("INVALID_REGION");
+    }
+    if (p.x < 0 || p.y < 0 || p.dest_x < 0 || p.dest_y < 0 || p.x + p.width > img.width || p.y + p.height > img.height || p.dest_x + p.width > img.width || p.dest_y + p.height > img.height) {
+      throw new Error("REGION_OUT_OF_RANGE");
+    }
+
+    const tmp = [];
+    for (let yy = 0; yy < p.height; yy++) {
+      for (let xx = 0; xx < p.width; xx++) {
+        tmp.push(img.getPixel(p.x + xx, p.y + yy));
+      }
+    }
+
+    if (move) {
+      const clearValue = requireSprite().colorMode === ColorMode.INDEXED ? 0 : encodePixel({ r: 0, g: 0, b: 0, a: 0 });
+      for (let yy = 0; yy < p.height; yy++) {
+        for (let xx = 0; xx < p.width; xx++) {
+          img.putPixel(p.x + xx, p.y + yy, clearValue);
+        }
+      }
+    }
+
+    let k = 0;
+    for (let yy = 0; yy < p.height; yy++) {
+      for (let xx = 0; xx < p.width; xx++) {
+        img.putPixel(p.dest_x + xx, p.dest_y + yy, tmp[k++]);
+      }
+    }
+    requireSprite().commit();
+    return { moved: !!move, pixels: tmp.length };
+  }
+
+  function clearRegion(p) {
+    const img = celAt(p.layer, p.frame).image;
+    if (p.width <= 0 || p.height <= 0 || p.width * p.height > MAX_PIXELS || p.x < 0 || p.y < 0 || p.x + p.width > img.width || p.y + p.height > img.height) {
+      throw new Error("REGION_OUT_OF_RANGE");
+    }
+    const sprite = requireSprite();
+    if (sprite.colorMode === ColorMode.INDEXED) {
+      throw new Error("INDEXED_REGION_CLEAR_UNSUPPORTED");
+    }
+    const clearValue = encodePixel({ r: 0, g: 0, b: 0, a: 0 });
+    let count = 0;
+    for (let yy = 0; yy < p.height; yy++) {
+      for (let xx = 0; xx < p.width; xx++) {
+        img.putPixel(p.x + xx, p.y + yy, clearValue);
+        count++;
+      }
+    }
+    sprite.commit();
+    return { cleared: count };
+  }
+
+  function flipRegion(p) {
+    const img = celAt(p.layer, p.frame).image;
+    if (p.width <= 0 || p.height <= 0 || p.width * p.height > MAX_PIXELS || p.x < 0 || p.y < 0 || p.x + p.width > img.width || p.y + p.height > img.height) {
+      throw new Error("REGION_OUT_OF_RANGE");
+    }
+    const tmp = [];
+    for (let yy = 0; yy < p.height; yy++) {
+      for (let xx = 0; xx < p.width; xx++) {
+        tmp.push(img.getPixel(p.x + xx, p.y + yy));
+      }
+    }
+    for (let yy = 0; yy < p.height; yy++) {
+      for (let xx = 0; xx < p.width; xx++) {
+        const sx = p.horizontal ? p.width - 1 - xx : xx;
+        const sy = p.horizontal ? yy : p.height - 1 - yy;
+        img.putPixel(p.x + xx, p.y + yy, tmp[sy * p.width + sx]);
+      }
+    }
+    requireSprite().commit();
+    return { flipped: true, horizontal: !!p.horizontal };
+  }
+
+  function resolvedRGBAImage(img) {
+    const out = [];
+    for (let y = 0; y < img.height; y++) {
+      for (let x = 0; x < img.width; x++) {
+        const c = decodePixel(img.getPixel(x, y));
+        out.push(c.r, c.g, c.b, c.a);
+      }
+    }
+    return out;
+  }
+
+  function previewFrame(frame) {
+    const sprite = requireSprite();
+    const layers = [];
+    for (let i = 0; i < sprite.layerCount; i++) {
+      const layer = sprite.layer(i);
+      if (!layer || !layer.isImage || !layer.isVisible) {
+        continue;
+      }
+      const cel = layer.cel(frame);
+      if (!cel || !cel.image) {
+        continue;
+      }
+      const entry = { layer: i, x: cel.x, y: cel.y, width: cel.image.width, height: cel.image.height };
+      if (sprite.colorMode === ColorMode.RGB) {
+        entry.png_data_uri = cel.image.getPNGData();
+      } else {
+        entry.rgba = resolvedRGBAImage(cel.image);
+      }
+      layers.push(entry);
+    }
+    return {
+      frame: frame,
+      canvas_width: sprite.width,
+      canvas_height: sprite.height,
+      color_mode: sprite.colorMode,
+      layers: layers
+    };
+  }
+
+  function health() {
+    return {
+      connected: true,
+      bridge_version: BRIDGE_VERSION,
+      libresprite_version: String(app.version || ""),
+      platform: String(app.platform || ""),
+      mode: mode,
+      capabilities: {
+        frame_duration_read: false,
+        frame_duration_write: false,
+        frame_tags: false,
+        export_spritesheet: false,
+        preview: true,
+        pixels: true,
+        layers: true,
+        cels: true,
+        frames: true,
+        arbitrary_script: mode === "dev"
+      },
+      limitations: {
+        frame_duration: "Upstream scripting exposes FrameProperties as UI-only and no direct frame-duration API.",
+        frame_tags: "Current scripting reference exposes commands but no verified non-interactive tag object API.",
+        export_spritesheet: "ExportSpriteSheet is exposed as a GUI command without a verified non-interactive parameter API.",
+        indexed_region_clear: "Transparent palette index is not exposed reliably; SAFE mode refuses destructive guessing."
+      }
+    };
+  }
+
+  function unsupported(code, message) {
+    return { ok: false, unsupported: true, code: code, message: message };
+  }
+
+  function dispatch(op, p) {
+    switch (op) {
+      case "health":
+        return health();
+
+      case "get_sprite_info": {
+        const sprite = requireSprite();
+        return {
+          width: sprite.width,
+          height: sprite.height,
+          filename: sprite.filename,
+          color_mode: sprite.colorMode,
+          layer_count: sprite.layerCount,
+          active_frame: app.activeFrameNumber,
+          active_layer: app.activeLayerNumber,
+          frame_count: countFrames()
+        };
+      }
+
+      case "get_active_frame":
+        return { frame: app.activeFrameNumber };
+
+      case "set_active_frame":
+        gotoFrame(p.frame);
+        return { frame: app.activeFrameNumber };
+
+      case "get_frames": {
+        const count = countFrames();
+        const frames = [];
+        for (let i = 0; i < count; i++) frames.push(i);
+        return { count: count, frames: frames };
+      }
+
+      case "get_layers": {
+        const sprite = requireSprite();
+        const layers = [];
+        for (let i = 0; i < sprite.layerCount; i++) {
+          const layer = sprite.layer(i);
+          layers.push({
+            index: i,
+            name: layer.name,
+            visible: layer.isVisible,
+            editable: layer.isEditable,
+            image: layer.isImage,
+            background: layer.isBackground,
+            cel_count: layer.celCount
+          });
+        }
+        return { layers: layers };
+      }
+
+      case "add_frame": {
+        const before = countFrames();
+        app.command.clearParameters();
+        app.command.setParameter("content", "empty");
+        app.command.NewFrame();
+        app.command.clearParameters();
+        const after = countFrames();
+        if (after !== before + 1) throw new Error("POSTCONDITION_FAILED");
+        return { before: before, after: after, frame: app.activeFrameNumber };
+      }
+
+      case "insert_frame": {
+        gotoFrame(p.frame);
+        const before = countFrames();
+        gotoFrame(p.frame);
+        app.command.clearParameters();
+        app.command.setParameter("content", "empty");
+        app.command.NewFrame();
+        app.command.clearParameters();
+        const after = countFrames();
+        if (after !== before + 1) throw new Error("POSTCONDITION_FAILED");
+        return { before: before, after: after, frame: app.activeFrameNumber };
+      }
+
+      case "duplicate_frame": {
+        gotoFrame(p.frame);
+        const before = countFrames();
+        gotoFrame(p.frame);
+        app.command.clearParameters();
+        app.command.setParameter("content", "frame");
+        app.command.NewFrame();
+        app.command.clearParameters();
+        const after = countFrames();
+        if (after !== before + 1) throw new Error("POSTCONDITION_FAILED");
+        return { before: before, after: after, frame: app.activeFrameNumber };
+      }
+
+      case "delete_frame": {
+        gotoFrame(p.frame);
+        const before = countFrames();
+        if (before <= 1) throw new Error("CANNOT_DELETE_ONLY_FRAME");
+        gotoFrame(p.frame);
+        app.command.RemoveFrame();
+        const after = countFrames();
+        if (after !== before - 1) throw new Error("POSTCONDITION_FAILED");
+        return { before: before, after: after, frame: app.activeFrameNumber };
+      }
+
+      case "get_frame_durations":
+      case "set_frame_duration":
+      case "set_frame_durations":
+        return unsupported("UNSUPPORTED_FRAME_DURATION", health().limitations.frame_duration);
+
+      case "create_layer": {
+        const sprite = requireSprite();
+        const before = sprite.layerCount;
+        app.command.clearParameters();
+        app.command.setParameter("name", String(p.name || "Layer"));
+        app.command.setParameter("top", "true");
+        app.command.NewLayer();
+        app.command.clearParameters();
+        const after = sprite.layerCount;
+        if (after !== before + 1) throw new Error("POSTCONDITION_FAILED");
+        const layer = sprite.layer(after - 1);
+        if (!layer || layer.name !== String(p.name || "Layer")) throw new Error("POSTCONDITION_FAILED");
+        return { layer: after - 1, layer_count: after, name: layer.name };
+      }
+
+      case "delete_layer": {
+        const sprite = requireSprite();
+        const before = sprite.layerCount;
+        if (before <= 1) throw new Error("CANNOT_DELETE_ONLY_LAYER");
+        const target = layerAt(p.layer);
+        if (!target.isVisible) throw new Error("HIDDEN_LAYER_MUST_BE_VISIBLE");
+        if (!target.isEditable) throw new Error("LAYER_IS_LOCKED");
+        gotoLayer(p.layer);
+        app.command.RemoveLayer();
+        const after = sprite.layerCount;
+        if (after !== before - 1) throw new Error("POSTCONDITION_FAILED");
+        return { layer_count: after };
+      }
+
+      case "rename_layer": {
+        const layer = layerAt(p.layer);
+        layer.name = String(p.name);
+        requireSprite().commit();
+        if (layer.name !== String(p.name)) throw new Error("POSTCONDITION_FAILED");
+        return { layer: p.layer, name: layer.name };
+      }
+
+      case "set_layer_visibility": {
+        const layer = layerAt(p.layer);
+        layer.isVisible = !!p.visible;
+        requireSprite().commit();
+        return { layer: p.layer, visible: layer.isVisible };
+      }
+
+      case "set_active_layer":
+        gotoLayer(p.layer);
+        return { layer: app.activeLayerNumber };
+
+      case "get_cel": {
+        const cel = celAt(p.layer, p.frame);
+        return {
+          layer: p.layer,
+          frame: p.frame,
+          x: cel.x,
+          y: cel.y,
+          width: cel.image.width,
+          height: cel.image.height,
+          stride: cel.image.stride,
+          format: cel.image.format
+        };
+      }
+
+      case "copy_cel": {
+        const source = celAt(p.source_layer, p.source_frame);
+        const target = celAt(p.target_layer, p.target_frame);
+        if (source.image.width !== target.image.width || source.image.height !== target.image.height || source.image.stride !== target.image.stride) {
+          throw new Error("CEL_IMAGE_SIZE_MISMATCH");
+        }
+        const sourceData = source.image.getImageData();
+        const cloned = new Uint8Array(sourceData.length);
+        for (let i = 0; i < sourceData.length; i++) cloned[i] = sourceData[i];
+        target.image.putImageData(cloned);
+        target.setPosition(source.x, source.y);
+        requireSprite().commit();
+        return { copied: true, target_layer: p.target_layer, target_frame: p.target_frame };
+      }
+
+      case "move_cel": {
+        const cel = celAt(p.layer, p.frame);
+        cel.setPosition(p.x, p.y);
+        requireSprite().commit();
+        if (cel.x !== p.x || cel.y !== p.y) throw new Error("POSTCONDITION_FAILED");
+        return { x: cel.x, y: cel.y };
+      }
+
+      case "clear_cel": {
+        gotoFrame(p.frame);
+        gotoLayer(p.layer);
+        app.command.ClearCel();
+        const remaining = layerAt(p.layer).cel(p.frame);
+        if (remaining) throw new Error("POSTCONDITION_FAILED");
+        return { cleared: true };
+      }
+
+      case "get_pixel": {
+        const img = celAt(p.layer, p.frame).image;
+        if (!Number.isInteger(p.x) || !Number.isInteger(p.y) || p.x < 0 || p.y < 0 || p.x >= img.width || p.y >= img.height) {
+          throw new Error("PIXEL_OUT_OF_RANGE");
+        }
+        const result = decodePixel(img.getPixel(p.x, p.y));
+        result.x = p.x;
+        result.y = p.y;
+        return result;
+      }
+
+      case "get_pixels":
+      case "get_region":
+        return pixelsRegion(p);
+
+      case "draw_pixels":
+        return drawPixels(p);
+
+      case "set_region":
+        return setRegion(p);
+
+      case "copy_region":
+        return copyOrMoveRegion(p, false);
+
+      case "move_region":
+        return copyOrMoveRegion(p, true);
+
+      case "clear_region":
+        return clearRegion(p);
+
+      case "flip_region":
+        return flipRegion(p);
+
+      case "get_image_data": {
+        const img = celAt(p.layer, p.frame).image;
+        return {
+          width: img.width,
+          height: img.height,
+          stride: img.stride,
+          format: img.format,
+          data: bytesFromImage(img)
+        };
+      }
+
+      case "set_image_data": {
+        const img = celAt(p.layer, p.frame).image;
+        if (!Array.isArray(p.data) || p.data.length !== img.stride * img.height) {
+          throw new Error("IMAGE_DATA_LENGTH_MISMATCH");
+        }
+        const arr = new Uint8Array(p.data.length);
+        for (let i = 0; i < p.data.length; i++) {
+          const value = p.data[i];
+          if (!Number.isInteger(value) || value < 0 || value > 255) throw new Error("INVALID_IMAGE_BYTE");
+          arr[i] = value;
+        }
+        img.putImageData(arr);
+        requireSprite().commit();
+        return { bytes: p.data.length };
+      }
+
+      case "get_palette": {
+        const palette = requireSprite().palette;
+        const colors = [];
+        for (let i = 0; i < palette.length; i++) {
+          const c = rgbaComponents(palette.get(i));
+          c.index = i;
+          colors.push(c);
+        }
+        return { colors: colors };
+      }
+
+      case "set_palette_color": {
+        const palette = requireSprite().palette;
+        if (!Number.isInteger(p.index) || p.index < 0 || p.index >= palette.length) {
+          throw new Error("PALETTE_INDEX_OUT_OF_RANGE");
+        }
+        validateRGBA(p);
+        palette.set(p.index, packedRGBA(p));
+        requireSprite().commit();
+        const c = rgbaComponents(palette.get(p.index));
+        c.index = p.index;
+        return c;
+      }
+
+      case "get_tags":
+      case "create_tag":
+      case "delete_tag":
+        return unsupported("UNSUPPORTED_FRAME_TAGS", health().limitations.frame_tags);
+
+      case "render_frame_preview":
+        gotoFrame(p.frame);
+        return previewFrame(p.frame);
+
+      case "save_sprite":
+        if (!/\.(ase|aseprite)$/i.test(requireSprite().filename)) throw new Error("EDITABLE_PATH_REQUIRED_USE_SAVE_AS");
+        requireSprite().save();
+        return { saved: true, filename: requireSprite().filename };
+
+      case "save_as":
+        if (!/\.(ase|aseprite)$/i.test(String(p.path))) throw new Error("EDITABLE_PATH_REQUIRED");
+        requireSprite().saveAs(String(p.path), false);
+        return { saved: true, filename: requireSprite().filename, path: String(p.path) };
+
+      case "save_copy": {
+        if (!/\.aseprite$/i.test(String(p.path))) throw new Error("EDITABLE_PATH_REQUIRED");
+        const sprite = requireSprite();
+        const original = sprite.filename;
+        sprite.saveAs(String(p.path), true);
+        if (sprite.filename !== original) throw new Error("POSTCONDITION_FAILED");
+        return { saved: true, path: String(p.path), filename: original };
+      }
+
+      case "open_sprite":
+        app.open(String(p.path));
+        return { opened: true, path: String(p.path), filename: requireSprite().filename };
+
+      case "export_png":
+      case "export_gif":
+        return unsupported("UPDATE_PYTHON_EXPORT", "Update the Python server: native GUI export opens modal dialogs; use the batch snapshot exporter.");
+
+      case "export_spritesheet":
+        return unsupported("UNSUPPORTED_SPRITESHEET_EXPORT", health().limitations.export_spritesheet);
+
+      case "run_script":
+        if (mode !== "dev") throw new Error("DEV_MODE_REQUIRED");
+        return {
+          output: new Function("return (function(){" + String(p.script) + "\n}).call(this);")()
+        };
+
+      default:
+        throw new Error("OPERATION_NOT_ALLOWED");
+    }
+  }
+
+  function execute(req) {
+    if (req.protocol_version !== 1) {
+      fail(req.request_id, "PROTOCOL_MISMATCH", "Unsupported operation protocol");
+      return;
+    }
+    if (lastResult && lastResult.request_id === req.request_id) {
+      postResult(lastResult);
+      return;
+    }
+    const rid = req.request_id;
+    const op = req.operation;
+    const payload = req.payload || {};
+    executing = true;
+    try {
+      if (op === "run_script" && mode !== "dev") {
+        fail(rid, "DEV_MODE_REQUIRED", "run_script is unavailable in SAFE mode");
+        return;
+      }
+      ok(rid, dispatch(op, payload));
+    } catch (e) {
+      const message = String(e.message || e);
+      fail(rid, message.replace(/\s+/g, "_").toUpperCase(), message);
+    } finally {
+      executing = false;
+      schedule(0);
+    }
+  }
+
+  function poll() {
+    if (!polling || !token) return;
+    jsonRequest("/next", null, function(data, err, status) {
+      if (err) {
+        retry(err, status);
+        return;
+      }
+      success();
+      if (!polling) { schedule(0); return; }
+      if (data && data.idle) {
+        schedule(POLL_MS);
+        return;
+      }
+      if (data && data.request_id && data.operation) {
+        execute(data);
+        return;
+      }
+      retry("Malformed operation response", 0);
+    }, true);
+  }
+
+  function paintUI() {
+    if (!dialog || !active) return;
+    dialog.title = "LibreSprite MCP (" + mode.toUpperCase() + ")";
+    if (bridgeError) {
+      statusLabel.text = bridgeError;
+    } else if (polling && token) {
+      statusLabel.text = "Connected - " + mode.toUpperCase() + " mode";
+    } else if (polling) {
+      statusLabel.text = "Connecting...";
+    } else {
+      statusLabel.text = "Disconnected";
+    }
+    toggleButton.text = polling ? "Disconnect" : "Connect";
+  }
+
+  function tick() {
+    tickScheduled = false;
+    if (!active) return;
+    // Native commands run nested GUI event loops. A yield callback must not
+    // poll another operation while dispatch/save is still on the JS stack.
+    if (executing) { schedule(POLL_MS); return; }
+    if (request && Date.now() - request.started >= FETCH_TIMEOUT_MS) {
+      // Native storage is populated before *_fetch is dispatched. Recover a
+      // lost event without issuing another native request when possible.
+      if (storage.get(request.key + "_status") !== undefined) {
+        completeFetch(request.key);
+      } else {
+        request = null;
+        missingCallbacks++;
+        if (missingCallbacks >= 3) {
+          // storage.fetch has no cancellation API. Bound abandoned native
+          // requests if this runtime stops delivering any completions at all.
+          polling = false;
+          token = null;
+          bridgeError = "Native fetch stopped responding; reopen mcp.js";
+          paintUI();
+        } else {
+          retry("fetch callback timeout", 0);
+        }
+      }
+    }
+    if (!request && Date.now() >= nextAt) {
+      if (polling) {
+        if (!token) pair();
+        else if (resultToSend) sendResult();
+        else poll();
+      } else if (token) {
+        jsonRequest("/disconnect", {}, function() {
+          token = null;
+          resultToSend = null;
+          lastResult = null;
+          paintUI();
+        }, true);
+      }
+    }
+    if ((polling || request || token) && !tickScheduled) {
+      tickScheduled = true;
+      app.yield("mcp_tick_" + instanceId, 10);
+    }
+  }
+
+  function onEvent(event) {
+    if (event.indexOf("_mcp_") === 0 && event.slice(-6) === "_fetch") {
+      completeFetch(event.slice(0, -6));
+      return;
+    }
+    if (event === "mcp_tick_" + instanceId) { tick(); return; }
+    switch (event) {
+      case "init":
+        active = true;
+        dialog = app.createDialog("mcp_dialog");
+        statusLabel = dialog.addLabel("Disconnected", "mcp_status");
         dialog.addBreak();
-        dialog.canClose = !connected || !polling;
-        if ( connected ) {
-            dialog.addButton(
-                polling ? 'Disconnect': 'Connect',
-                'toggle'
-            );
+        toggleButton = dialog.addButton("Connect", "mcp_toggle");
+        if (typeof storage === "undefined" || typeof storage.fetch !== "function") {
+          bridgeError = "storage.fetch is unavailable in this LibreSprite build.";
         }
-    }
-
-
-    // MAIN //
-
-    /**
-     * Event handler.
-     *
-     * @global
-     * @param {string} event
-     */
-    function onEvent(event) {
-        switch (event) {
-            /**
-             * Initialize script.
-             */
-            case 'init':
-                active = true;
-                checkServerHealth();
-                paintUI();
-                return;
-            /**
-             * Cleanup script.
-             */
-            case '_close':
-                active = false;
-                connected = false;
-                polling = false;
-                return;
-            /**
-             * Events triggered by initial health checks.
-             */
-            case 'bad_health':
-                if (!active) {
-                    // The extension was closed, stop recursion...
-                    return;
-                }
-                checkServerHealth();
-                return;
-            case 'good_health':
-                paintUI();
-                return;
-            /**
-             * UI operation.
-             */
-            case 'toggle_click':
-                if (polling) {
-                    stopPolling();
-                } else {
-                    startPolling();
-                }
-                paintUI();
-                return;
-            /**
-             * Successful 'GET' event response triggered by `storage.fetch`.
-             */
-            case '_get_response_fetch':
-                _get_response && _get_response();
-                _get_response = null;
-                return;
-            /**
-             * Successful 'POST' event response triggered by `storage.fetch`.
-             */
-            case '_post_response_fetch':
-                _post_response && _post_response();
-                _post_response = null;
-                return;
-            /**
-             * Event triggered to continue polling the endpoint.
-             */
-            case 'poll':
-                if (!active) {
-                    // The extension was closed, stop recursion...
-                    // NOTE: This is a sanity check and should never be executed given the close button is not visible during polling
-                    stopPolling();
-                    return;
-                }
-                exec();
-                return;
-            default:
-                // No action for unknown events
-                break;
+        paintUI();
+        return;
+      case "mcp_dialog_close":
+        // Best-effort release if no fetch is active. Otherwise the bounded
+        // lease permits a newly opened script to pair automatically.
+        polling = false;
+        if (token && !request) {
+          jsonRequest("/disconnect", {}, function() { token = null; }, true);
         }
+        active = false;
+        dialog = null;
+        return;
+      case "mcp_toggle_click":
+        if (polling) {
+          polling = false;
+        } else {
+          polling = true;
+          bridgeError = "";
+        }
+        paintUI();
+        schedule(0);
+        return;
+      case "connect_click":
+        polling = true;
+        bridgeError = "";
+        paintUI();
+        schedule(0);
+        return;
+      case "disconnect_click":
+        polling = false;
+        paintUI();
+        schedule(0);
+        return;
+      default:
+        return;
     }
-    global.onEvent = onEvent;
+  }
+
+  global.onEvent = onEvent;
 })();
