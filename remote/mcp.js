@@ -8,7 +8,7 @@
 const global = this;
 
 (function LibreSpriteMCPBridge() {
-  const BRIDGE_VERSION = "0.2.2-safe";
+  const BRIDGE_VERSION = "0.2.3-safe";
   const BASE = "http://127.0.0.1:64823";
   const POLL_MS = 500;
   const FETCH_TIMEOUT_MS = 8000;
@@ -27,6 +27,7 @@ const global = this;
   let tickScheduled = false;
   let resultToSend = null;
   let lastResult = null;
+  let executing = false;
   let statusLabel = null;
   let toggleButton = null;
   // Native fetch logs storage keys. Keep the pairing nonce separate from those
@@ -870,25 +871,31 @@ const global = this;
         return previewFrame(p.frame);
 
       case "save_sprite":
+        if (!/\.(ase|aseprite)$/i.test(requireSprite().filename)) throw new Error("EDITABLE_PATH_REQUIRED_USE_SAVE_AS");
         requireSprite().save();
         return { saved: true, filename: requireSprite().filename };
 
       case "save_as":
+        if (!/\.(ase|aseprite)$/i.test(String(p.path))) throw new Error("EDITABLE_PATH_REQUIRED");
         requireSprite().saveAs(String(p.path), false);
         return { saved: true, filename: requireSprite().filename, path: String(p.path) };
+
+      case "save_copy": {
+        if (!/\.aseprite$/i.test(String(p.path))) throw new Error("EDITABLE_PATH_REQUIRED");
+        const sprite = requireSprite();
+        const original = sprite.filename;
+        sprite.saveAs(String(p.path), true);
+        if (sprite.filename !== original) throw new Error("POSTCONDITION_FAILED");
+        return { saved: true, path: String(p.path), filename: original };
+      }
 
       case "open_sprite":
         app.open(String(p.path));
         return { opened: true, path: String(p.path), filename: requireSprite().filename };
 
       case "export_png":
-        if (p.frame !== null && p.frame !== undefined) gotoFrame(p.frame);
-        requireSprite().saveAs(String(p.path), true);
-        return { exported: true, path: String(p.path), format: "png" };
-
       case "export_gif":
-        requireSprite().saveAs(String(p.path), true);
-        return { exported: true, path: String(p.path), format: "gif" };
+        return unsupported("UPDATE_PYTHON_EXPORT", "Update the Python server: native GUI export opens modal dialogs; use the batch snapshot exporter.");
 
       case "export_spritesheet":
         return unsupported("UNSUPPORTED_SPRITESHEET_EXPORT", health().limitations.export_spritesheet);
@@ -916,6 +923,7 @@ const global = this;
     const rid = req.request_id;
     const op = req.operation;
     const payload = req.payload || {};
+    executing = true;
     try {
       if (op === "run_script" && mode !== "dev") {
         fail(rid, "DEV_MODE_REQUIRED", "run_script is unavailable in SAFE mode");
@@ -925,6 +933,9 @@ const global = this;
     } catch (e) {
       const message = String(e.message || e);
       fail(rid, message.replace(/\s+/g, "_").toUpperCase(), message);
+    } finally {
+      executing = false;
+      schedule(0);
     }
   }
 
@@ -967,6 +978,9 @@ const global = this;
   function tick() {
     tickScheduled = false;
     if (!active) return;
+    // Native commands run nested GUI event loops. A yield callback must not
+    // poll another operation while dispatch/save is still on the JS stack.
+    if (executing) { schedule(POLL_MS); return; }
     if (request && Date.now() - request.started >= FETCH_TIMEOUT_MS) {
       // Native storage is populated before *_fetch is dispatched. Recover a
       // lost event without issuing another native request when possible.

@@ -165,3 +165,29 @@ test('missing callbacks are bounded, avoiding unbounded native workers', () => {
   assert.equal(h.requests.length, 3);
   assert.match(h.label.text, /Native fetch stopped responding/);
 });
+
+test('native nested GUI yields cannot execute/poll another operation during save', () => {
+  const h = harness(); h.paired();
+  let saved = 0;
+  h.context.app.activeSprite = {filename:'test.aseprite', saveAs() {
+    saved++;
+    for (let i=0;i<10;i++) h.tick(500);
+    assert.equal(h.requests.length, 2);
+  }};
+  h.reply(h.requests[1], 200, {protocol_version:1,request_id:'save',operation:'save_copy',payload:{path:'copy.aseprite'}});
+  h.tick();
+  assert.equal(saved, 1);
+  assert.equal(JSON.parse(h.requests[2][4]).result.saved, true);
+});
+
+test('legacy exports and non-editable saves never open native dialogs', () => {
+  for (const operation of ['export_gif','export_png','save_as','save_sprite']) {
+    const h = harness(); h.paired();
+    h.context.app.activeSprite = {filename:'test.gif', saveAs(){throw Error('unsafe native save');}, save(){throw Error('unsafe native save');}};
+    h.reply(h.requests[1], 200, {protocol_version:1,request_id:'export',operation,payload:{path:'test.gif'}});
+    h.tick();
+    const response = JSON.parse(h.requests[2][4]);
+    assert.equal(response.ok === false || response.result.unsupported === true, true);
+    assert.equal(JSON.stringify(response).includes('unsafe native save'), false);
+  }
+});

@@ -85,6 +85,7 @@ For a checkout of this fork:
       ],
       "env": {
         "LIBRESPRITE_MCP_MODE": "safe",
+        "LIBRESPRITE_MCP_EXECUTABLE": "C:\\path\\to\\libresprite.exe",
         "LIBRESPRITE_MCP_ALLOWED_ROOT": "C:\\Users\\YOUR_NAME\\Documents\\Sprites"
       }
     }
@@ -93,6 +94,20 @@ For a checkout of this fork:
 ```
 
 SAFE mode is the default even if `LIBRESPRITE_MCP_MODE` is omitted.
+
+PNG/GIF export requires `LIBRESPRITE_MCP_EXECUTABLE` (or `libresprite` on PATH).
+The MCP saves a private native `.aseprite` copy and runs LibreSprite's `--batch`
+exporter with fixed arguments, no shell or script. This preserves native pixels,
+layers and GIF timing without the GUI save-options dialogs. PNG exports exactly
+one requested frame. The destination is replaced only after the output can be
+decoded and its dimensions verified; temporary files are cleaned up. Configure
+an absolute executable path from your trusted LibreSprite installation, never an
+untrusted downloaded executable. Without it, export returns an explicit error.
+
+`save_as`/`save_sprite` accept editable `.ase`/`.aseprite` files only; use the
+export tools for PNG/GIF. Update Python **and** the bridge to `0.2.3-safe` or later
+and restart both processes to load this fix. Running scripts (and closing the
+MCP dialog) affects only that editor instance; keep the connected instance open.
 
 ## Confirm SAFE mode
 

@@ -3,6 +3,12 @@ from __future__ import annotations
 import base64
 import io
 import math
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import threading
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -93,11 +99,74 @@ def _scale_png(raw: bytes, scale: int) -> bytes:
 class MCPServer:
     def __init__(self, proxy: LibrespriteProxy, server_name: str = "libresprite"):
         self.proxy = proxy
+        self._operations = threading.RLock()
         self.mcp = FastMCP(server_name)
         self._setup_tools()
 
     def call(self, operation: str, **payload: Any) -> dict[str, Any]:
-        return _unwrap(self.proxy.execute(operation, payload))
+        with self._operations:
+            return _unwrap(self.proxy.execute(operation, payload))
+
+    def export(self, path: str, format: str, frame: int | None = None) -> dict:
+        """Snapshot the open editor, then let LibreSprite itself export without UI.
+
+        No shell, arbitrary arguments, script, animation synthesis or guessed
+        timing. A private sibling directory keeps writes atomic and in scope.
+        """
+        target = Path(normalize_allowed_path(path, self.proxy.config.allowed_root))
+        if format not in {"png", "gif"} or target.suffix.lower() != "." + format:
+            raise ValueError("output extension must match the export format")
+        executable = os.environ.get("LIBRESPRITE_MCP_EXECUTABLE") or shutil.which("libresprite")
+        if not executable or not Path(executable).is_file():
+            return {"ok": False, "unsupported": True, "code": "EXPORT_EXECUTABLE_REQUIRED",
+                    "message": "Set LIBRESPRITE_MCP_EXECUTABLE to the LibreSprite executable for non-interactive export."}
+        with self._operations:
+            info = self.call("get_sprite_info")
+            if info.get("ok") is False:
+                return info
+            if format == "png":
+                frame = info["active_frame"] if frame is None else frame
+                if type(frame) is not int or not 0 <= frame < info["frame_count"]:
+                    raise ValueError("frame out of range")
+            with tempfile.TemporaryDirectory(prefix=".libresprite-export-", dir=target.parent) as directory:
+                snapshot = Path(directory) / "snapshot.aseprite"
+                result = self.call("save_copy", path=str(snapshot))
+                if result.get("ok") is False:
+                    return result
+                # saveAs returns void even on native save failure. Never trust
+                # its return alone, nor convert an old pre-existing file.
+                if not snapshot.is_file():
+                    raise RuntimeError("LibreSprite did not create the export snapshot")
+                with snapshot.open("rb") as stream:
+                    header = stream.read(128)
+                if len(header) != 128 or header[4:6] != b"\xe0\xa5":
+                    raise RuntimeError("LibreSprite produced an invalid editable snapshot")
+                output = Path(directory) / ("export." + format)
+                command = [str(Path(executable).resolve()), "--batch"]
+                if format == "png":
+                    # Upstream frame-range applies to sheet import only, not
+                    # --save-as (which would export every frame as a sequence).
+                    command += ["--sheet", str(output), "--frame-range", f"{frame},{frame}", str(snapshot)]
+                else:
+                    command += [str(snapshot), "--save-as", str(output)]
+                startup = None
+                if os.name == "nt":
+                    startup = subprocess.STARTUPINFO()
+                    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startup.wShowWindow = 0
+                process = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, timeout=30, startupinfo=startup, check=False)
+                if process.returncode != 0 or not output.is_file():
+                    raise RuntimeError("LibreSprite batch export failed; destination was not replaced")
+                with PILImage.open(output) as exported:
+                    if exported.format != format.upper() or exported.size != (info["width"], info["height"]):
+                        raise RuntimeError("LibreSprite export format/dimensions did not match")
+                    count = exported.n_frames if format == "gif" else 1
+                    for index in range(count):
+                        exported.seek(index)
+                        exported.load()
+                os.replace(output, target)
+                return {"exported": True, "path": str(target), "format": format, "frame_count": count}
 
     def status(self) -> dict[str, Any]:
         info: dict[str, Any] = {
@@ -439,15 +508,13 @@ class MCPServer:
 
         @m.tool()
         def export_png(path: str, frame: int | None = None) -> dict:
-            """Export PNG to a validated path. Optionally activate a 0-based frame first."""
-            safe_path = normalize_allowed_path(path, self.proxy.config.allowed_root)
-            return self.call("export_png", path=safe_path, frame=frame)
+            """Export one frame (default active) via a native snapshot and LibreSprite batch, without dialogs."""
+            return self.export(path, "png", frame)
 
         @m.tool()
         def export_gif(path: str) -> dict:
-            """Export an animated GIF through LibreSprite's normal save-as-copy path."""
-            safe_path = normalize_allowed_path(path, self.proxy.config.allowed_root)
-            return self.call("export_gif", path=safe_path)
+            """Export GIF via a native snapshot and LibreSprite batch, retaining original frame timing without dialogs."""
+            return self.export(path, "gif")
 
         @m.tool()
         def export_spritesheet(path: str) -> dict:

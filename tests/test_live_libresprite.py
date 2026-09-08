@@ -15,7 +15,7 @@ from PIL import Image
 import pytest
 
 from libresprite_mcp.libresprite_proxy import LibrespriteProxy
-from libresprite_mcp.mcp_server import _png_bytes_from_result
+from libresprite_mcp.mcp_server import MCPServer, _png_bytes_from_result
 from libresprite_mcp.protocol import RelayConfig
 
 EXE = os.environ.get("LIBRESPRITE_MCP_LIVE_EXE")
@@ -31,7 +31,8 @@ def until(predicate, timeout=15):
     raise AssertionError("live LibreSprite condition timed out")
 
 
-def test_real_pixels_frames_previews_and_recovery(tmp_path):
+def test_real_pixels_frames_previews_and_recovery(tmp_path, monkeypatch):
+    monkeypatch.setenv("LIBRESPRITE_MCP_EXECUTABLE", EXE)
     proxy = LibrespriteProxy(RelayConfig(port=0, timeout=8, lease_seconds=10))
     faults = {"/next": 0, "/result": 0}
     @proxy.app.before_request
@@ -82,6 +83,21 @@ def test_real_pixels_frames_previews_and_recovery(tmp_path):
             assert call("add_frame")["after"] == 3
             assert call("delete_frame", frame=2)["after"] == 2
             call("save_as", path=str(tmp_path / "verified.aseprite"))
+            before_export = call("get_sprite_info")
+            server = MCPServer(proxy)
+            assert server.export(str(tmp_path / "verified.gif"), "gif")["exported"]
+            with Image.open(tmp_path / "verified.gif") as gif:
+                assert gif.n_frames == 2
+                assert gif.info["duration"] == 100
+                assert gif.convert("RGB").getpixel((0, 0)) == (255, 0, 0)
+                gif.seek(1)
+                assert gif.info["duration"] == 100
+                assert gif.convert("RGB").getpixel((0, 0)) == (0, 255, 0)
+            assert server.export(str(tmp_path / "verified.png"), "png", 1)["exported"]
+            with Image.open(tmp_path / "verified.png") as png:
+                assert png.convert("RGBA").getpixel((0, 0)) == (0, 255, 0, 255)
+            assert call("get_sprite_info") == before_export
+            assert not list(tmp_path.glob(".libresprite-export-*"))
             # Real HTTP 0: stop the socket listener long enough for a poll to
             # fail, then restart the relay with a new token and empty session.
             old_token = proxy.session_token
@@ -96,6 +112,16 @@ def test_real_pixels_frames_previews_and_recovery(tmp_path):
             time.sleep(3)
             assert proxy.connected
             assert call("health")["connected"]
+            # Abrupt editor exit, like closing/reopening LibreSprite: a new
+            # script must recover the stale lease without ALREADY_PAIRED lockout.
+            old_token = proxy.session_token
+            process.terminate()
+            process.wait(timeout=10)
+            process = subprocess.Popen([EXE, str(tmp_path / "verified.aseprite"), "--script", str(script)],
+                                       stdout=log, stderr=log, startupinfo=startup)
+            until(lambda: proxy.connected and proxy.session_token != old_token, timeout=20)
+            assert call("get_frames")["count"] == 2
+            assert call("get_pixel", layer=0, frame=1, x=0, y=0)["g"] == 255
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -124,7 +150,9 @@ def test_real_stdio_to_libresprite(tmp_path):
             startup = subprocess.STARTUPINFO()
             startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startup.wShowWindow = 0
-        async with stdio_client(parameters(port)) as (read, write):
+        params = parameters(port)
+        params.env = {**os.environ, "LIBRESPRITE_MCP_EXECUTABLE": EXE}
+        async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 with (tmp_path / "libresprite.log").open("w", encoding="utf-8") as log:
@@ -141,6 +169,8 @@ def test_real_stdio_to_libresprite(tmp_path):
                         assert (await call("draw_pixels", layer=0, frame=0,
                             pixels=[{"x": 0, "y": 0, "r": 255, "g": 0, "b": 0, "a": 255}]))["written"] == 1
                         assert (await call("duplicate_frame", frame=0))["after"] == 2
+                        await call("draw_pixels", layer=0, frame=1,
+                            pixels=[{"x": 0, "y": 0, "r": 0, "g": 255, "b": 0, "a": 255}])
                         response = await session.call_tool("render_animation_preview", {"frames": [0, 1], "scale": 1})
                         assert not response.isError
                         block = next(block for block in response.content if block.type == "image")
@@ -149,6 +179,10 @@ def test_real_stdio_to_libresprite(tmp_path):
                         assert image.getpixel((0, 18)) == (255, 0, 0, 255)
                         image.save(tmp_path / "stdio-contact-sheet.png")
                         assert (await call("get_capabilities"))["capabilities"]["arbitrary_script"] is False
+                        assert (await call("export_gif", path=str(tmp_path / "stdio.gif")))["exported"]
+                        assert (await call("export_png", path=str(tmp_path / "stdio.png"), frame=1))["exported"]
+                        with Image.open(tmp_path / "stdio.gif") as gif:
+                            assert gif.n_frames == 2
                     finally:
                         if process.poll() is None:
                             process.terminate()

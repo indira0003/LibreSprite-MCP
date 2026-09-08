@@ -59,6 +59,7 @@ SAFE_OPERATIONS = {
     "export_spritesheet",
     "save_sprite",
     "save_as",
+    "save_copy",
     "open_sprite",
 }
 
