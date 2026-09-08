@@ -83,6 +83,11 @@ def test_real_pixels_frames_previews_and_recovery(tmp_path, monkeypatch):
             assert call("add_frame")["after"] == 3
             assert call("delete_frame", frame=2)["after"] == 2
             call("save_as", path=str(tmp_path / "verified.aseprite"))
+            assert call("create_layer", name="Temporary test")["layer"] == 1
+            call("set_layer_visibility", layer=1, visible=False)
+            assert proxy.execute("delete_layer", {"layer": 1})["error"]["code"] == "HIDDEN_LAYER_MUST_BE_VISIBLE"
+            call("set_layer_visibility", layer=1, visible=True)
+            assert call("delete_layer", layer=1)["layer_count"] == 1
             before_export = call("get_sprite_info")
             server = MCPServer(proxy)
             assert server.export(str(tmp_path / "verified.gif"), "gif")["exported"]

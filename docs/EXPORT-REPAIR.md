@@ -28,6 +28,10 @@ Fixes:
   not reported as success. Private intermediates are scoped to the destination
   directory, so allowed-root remains effective for the export operation.
 - Editable saves require `.ase` or `.aseprite` to avoid format-option dialogs.
+- Hidden/locked layer deletion reports an explicit precondition error before
+  calling the native command. The installed build disables hidden deletion;
+  newer upstream versions display a confirmation dialog. Make the named layer
+  visible first when intentionally deleting it. Live tests cover this sequence.
 
 Opt-in real-executable tests now cover PNG/GIF output pixels, two animation frames
 and their 100 ms durations, unchanged editor filename/frame state, full MCP STDIO

@@ -191,3 +191,13 @@ test('legacy exports and non-editable saves never open native dialogs', () => {
     assert.equal(JSON.stringify(response).includes('unsafe native save'), false);
   }
 });
+
+test('hidden or locked layer deletion fails explicitly before native commands', () => {
+  for (const [visible, editable, code] of [[0,1,'HIDDEN_LAYER_MUST_BE_VISIBLE'], [1,0,'LAYER_IS_LOCKED']]) {
+    const h = harness(); h.paired();
+    h.context.app.activeSprite = {layerCount:2, layer:() => ({isImage:true,isVisible:visible,isEditable:editable})};
+    h.reply(h.requests[1], 200, {protocol_version:1,request_id:'delete',operation:'delete_layer',payload:{layer:1}});
+    h.tick();
+    assert.equal(JSON.parse(h.requests[2][4]).error.code, code);
+  }
+});
